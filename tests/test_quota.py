@@ -68,6 +68,10 @@ class IndependentQuotaTests(unittest.TestCase):
     def progress(self, agent):
         return json.loads((self.root / 'workers' / f'agent_{agent}' / 'progress.json').read_text())
 
+    def active_run(self):
+        data = json.loads((self.root / 'collection_state.json').read_text())
+        return next(x for x in data['runs'] if x['run_id'] == data['active_run_id'])
+
     def test_historical_urls_never_consume_quota_and_are_deduplicated(self):
         self.insert_legacy('01', 'old1')
         self.insert_legacy('LEGACY', 'old2')
@@ -75,8 +79,10 @@ class IndependentQuotaTests(unittest.TestCase):
         self.assertFalse((self.root / 'collection_state.json').exists())
         status = self.cli('record.py', 'status', '--all').stdout
         self.assertIn('existing_rows=2', status)
-        self.assertIn('agent_01: agent_new_images_collected=0/2', status)
-        self.assertEqual(json.loads((self.root / 'collection_state.json').read_text())['baseline_row_count'], 2)
+        self.assertIn('progress=1/3 | agent_new_images_collected=0/2', status)
+        run = self.active_run()
+        self.assertEqual(run['baseline_row_count'], 2)
+        self.assertEqual(run['agents']['01'], {'initial_count': 1, 'agent_quota': 2, 'target_count': 3})
         self.assertIn('DUPLICATE', self.add('01', 'old2').stdout)
         self.assertEqual(self.progress('01')['agent_new_images_collected'], 0)
         self.assertIn('ACCEPTED', self.add('01', 'new1').stdout)
@@ -103,12 +109,20 @@ class IndependentQuotaTests(unittest.TestCase):
         self.assertIn('QUOTA_REACHED', self.add('01', 'extra').stdout)
         self.assertEqual(self.progress('01')['agent_new_images_collected'], 2)
 
-    def test_config_change_is_independent_and_no_global_cap(self):
+    def test_config_changes_apply_only_to_new_runs(self):
         self.cli('record.py', 'status', '--all')
         cfg_path = self.root / 'config.json'
         cfg = json.loads(cfg_path.read_text())
         cfg['agent_quota'] = {'01': 1, '02': 4}
         cfg_path.write_text(json.dumps(cfg))
+        # A config edit must not silently mutate the persisted target on resume.
+        error = self.cli('record.py', 'status', '--agent-id', '01', check=False)
+        self.assertNotEqual(error.returncode, 0)
+        self.assertIn('changed during run', error.stderr)
+        self.assertIn('still incomplete', self.cli('record.py', 'start-run', check=False).stderr)
+        self.assertIn('run-000002', self.cli('record.py', 'start-run', '--force').stdout)
+        self.assertEqual(self.active_run()['agents']['01']['target_count'], 1)
+        self.assertEqual(self.active_run()['agents']['02']['target_count'], 4)
         self.assertIn('ACCEPTED', self.add('01', 'one').stdout)
         self.assertIn('QUOTA_REACHED', self.add('01', 'two').stdout)
         for n in range(4):
@@ -132,6 +146,76 @@ class IndependentQuotaTests(unittest.TestCase):
         self.assertEqual(self.cli('record.py', 'audit').returncode, 0)
         with ZipFile(self.root / 'images.xlsx') as x:
             self.assertIsNone(x.testzip())
+
+    def test_fresh_second_run_snapshots_all_previous_records(self):
+        self.insert_legacy('01', 'old')
+        self.insert_legacy('02', 'other_old')
+        old_bytes = (self.root / 'images.xlsx').read_bytes()
+        initial = self.cli('record.py', 'status', '--all').stdout
+        self.assertIn('agent_01: run=run-000001 | progress=1/3', initial)
+        self.assertEqual((self.root / 'images.xlsx').read_bytes(), old_bytes)
+        self.add('01', 'first_run_1')
+        self.add('01', 'first_run_2')
+        for n in range(3):
+            self.add('02', f'first_run_b{n}')
+        self.assertIn('run-000002', self.cli('record.py', 'start-run').stdout)
+        second = self.active_run()
+        self.assertEqual(second['agents']['01'], {'initial_count': 3, 'agent_quota': 2, 'target_count': 5})
+        self.assertEqual(second['agents']['02'], {'initial_count': 4, 'agent_quota': 3, 'target_count': 7})
+        progress = self.cli('record.py', 'status', '--agent-id', '01').stdout
+        self.assertIn('progress=3/5', progress)
+        self.assertIn('agent_new_images_collected=0/2', progress)
+        self.assertIn('DUPLICATE', self.add('01', 'first_run_1').stdout)
+        self.assertIn('ACCEPTED', self.add('01', 'second_run_1').stdout)
+        self.assertIn('progress=4/5', self.cli('record.py', 'status', '--agent-id', '01').stdout)
+        self.assertIn('run-000002', self.progress('01')['run_id'])
+        self.assertIn('ACCEPTED', self.add('01', 'second_run_2').stdout)
+        self.assertIn('QUOTA_REACHED', self.add('01', 'second_run_3').stdout)
+        self.assertEqual(len(json.loads((self.root / 'collection_state.json').read_text())['runs']), 2)
+        self.assertEqual(self.cli('record.py', 'audit').returncode, 0)
+
+    def test_legacy_v1_baseline_migrates_without_reclassifying_rows(self):
+        self.insert_legacy('01', 'before_migration')
+        self.cli('record.py', 'status', '--all')
+        old = self.active_run()
+        prior = {'version': 1, 'initialized_at': old['initialized_at'],
+                 'baseline_row_count': old['baseline_row_count'],
+                 'baseline_sha256': old['baseline_sha256']}
+        (self.root / 'collection_state.json').write_text(json.dumps(prior))
+        self.insert_legacy('01', 'after_old_baseline')
+        output = self.cli('record.py', 'status', '--agent-id', '01').stdout
+        self.assertIn('progress=2/3', output)
+        self.assertIn('agent_new_images_collected=1/2', output)
+        self.assertEqual(self.active_run()['agents']['01']['initial_count'], 1)
+        self.assertEqual(self.progress('01')['agent_new_images_collected'], 1)
+        self.assertIn('ACCEPTED', self.add('01', 'final_new').stdout)
+        self.assertIn('QUOTA_REACHED', self.add('01', 'excess').stdout)
+
+    def test_example_1000_existing_plus_500_fresh_quota(self):
+        cfg_path = self.root / 'config.json'
+        cfg = json.loads(cfg_path.read_text())
+        cfg['agent_quota']['01'] = 500
+        cfg_path.write_text(json.dumps(cfg))
+        code = ('import record,json; '
+                'rows=[list(record.COLS)]+[["01","old","old","old"] for _ in range(1000)]; '
+                'print(json.dumps(record._snapshot_run(rows,1)["agents"]["01"]))')
+        p = subprocess.run([sys.executable, '-c', code], cwd=self.root,
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout),
+                         {'initial_count': 1000, 'agent_quota': 500, 'target_count': 1500})
+
+    def test_stale_run_cannot_write_to_fresh_run(self):
+        self.cli('record.py', 'start-run')
+        self.assertEqual(self.active_run()['run_id'], 'run-000001')
+        self.cli('record.py', 'start-run', '--force')
+        p = self.cli('record.py', 'add', '--agent-id', '01', '--run-id', 'run-000001',
+                     '--original-filename', 'Street_stale.jpg',
+                     '--original-image-url', self.uri('stale'),
+                     '--hrvs-suitability', 'Test candidate', check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('Collector started in', p.stderr)
+        self.assertEqual(len(self.read_rows()), 1)
 
     def test_historical_modification_detected(self):
         import os

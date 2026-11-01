@@ -223,10 +223,11 @@ def get_agent(args):
     return record.agent_from_workdir(args.agent_id)
 
 
-def get_agent_new_images_collected(agent):
+def agent_run_progress(agent):
     with record.excel_lock():
-        counts, _, _ = record.counts_and_rows()
-        return counts[agent]
+        counts, _, run = record.counts_and_rows()
+        snap = run['agents'][agent]
+        return counts[agent], run['run_id'], snap['agent_quota'], snap['initial_count'], snap['target_count']
 
 
 def cmd_test(_args):
@@ -251,8 +252,10 @@ def cmd_collect(args):
     keywords = keyword_pool(agent)
     if not keywords:
         raise RuntimeError(f'Agent {agent} has no keywords.txt')
-    accepted = get_agent_new_images_collected(agent)
-    limit = project.quota(agent)
+    accepted, run_id, limit, initial_count, target_count = agent_run_progress(agent)
+    print(f'RUN | agent={agent} | run={run_id} | initial_count={initial_count} '
+          f'| target_count={target_count} | progress={initial_count + accepted}/{target_count} '
+          f'| agent_new_images_collected={accepted}/{limit}')
     if accepted >= limit:
         print(f'QUOTA_REACHED | agent={agent} | agent_new_images_collected={accepted}/{limit}')
         return
@@ -264,7 +267,7 @@ def cmd_collect(args):
         ki = cursor['keyword_index']
         offset = cursor['offset']
         if ki >= len(keywords):
-            run_record('note', '--agent-id', agent, '--message', 'All configured API keyword searches exhausted; append fresh focused keywords to your own keywords file to continue')
+            run_record('note', '--agent-id', agent, '--run-id', run_id, '--message', 'All configured API keyword searches exhausted; append fresh focused keywords to your own keywords file to continue')
             print(f'KEYWORDS_EXHAUSTED | agent={agent} | agent_new_images_collected={accepted}/{limit}')
             return
         keyword = keywords[ki]
@@ -278,7 +281,7 @@ def cmd_collect(args):
             filename = item['original_filename']
             # EXPLICITLY metadata-only. Do not assert that bags, people, etc. were seen.
             reason = f'Metadata-only candidate; keyword: {keyword}; relevant filename; {item["width"]}x{item["height"]} px; visual complexity unverified'
-            result = run_record('add', '--agent-id', agent, '--original-filename', filename,
+            result = run_record('add', '--agent-id', agent, '--run-id', run_id, '--original-filename', filename,
                                 '--original-image-url', item['original_image_url'], '--hrvs-suitability', reason)
             if result.startswith('ACCEPTED'):
                 new += 1
@@ -298,7 +301,7 @@ def cmd_collect(args):
         cursor['last_updated'] = stamp()
         save_cursor(agent, cursor)
         next_kw = keywords[cursor['keyword_index']] if cursor['keyword_index'] < len(keywords) else '(no keywords left)'
-        run_record('checkpoint', '--agent-id', agent, '--keyword', keyword,
+        run_record('checkpoint', '--agent-id', agent, '--run-id', run_id, '--keyword', keyword,
                    '--page', str(offset // args.page_size + 1),
                    '--next-action', f'API resume: keyword={next_kw}; offset={cursor["offset"]}; cursor=api_cursor.json')
     print(f'BATCH_DONE | agent={agent} | agent_new_images_collected={accepted}/{limit} | new={new} | pages={num_pages} | examined={seen} | resume with same collect command')

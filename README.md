@@ -1,78 +1,56 @@
-# HRVS Collection — per-agent quota / metadata-only Wikimedia API
+# HRVS Collection — fresh independent quotas per run
 
-Collect high-resolution Wikimedia Commons image URL **metadata candidates** (no downloaded images) in a shared `images.xlsx`. Ten configured workers have independent quotas and keyword pools; workbook size never caps collection. Neither a global image target nor a derived division of a total is used.
+Ten API-only workers collect unique high-resolution Wikimedia Commons **original image URLs** into a shared `images.xlsx`. No images are downloaded. Each agent has its own `agent_quota` in `config.json`; there is **no global target or limit**.
 
-## Configure independent quotas
+## Fresh run semantics
+At the start of each **new collection run**, `record.py` snapshots each agent's existing image count in `images.xlsx`:
 
-Edit `config.json` only. `agent_quota` maps each configured two-digit agent ID to its **new image quota**:
+`initial_count = existing records belonging to this agent`  
+`target_count = initial_count + agent_quota`  
+`agent_new_images_collected = records appended by this agent since this run began`  
+`current_count = initial_count + agent_new_images_collected`
+
+**Stop only when `agent_new_images_collected >= agent_quota`.** Example: 1,000 existing images and a 500-image config quota means **1000/1500** at initialization, then 1001/1500 after one accepted new URL, and completion at 1500/1500. Every run gives a fresh quota, regardless of historical rows from the same agent.
+
+## Initialization, resume and creating another run
+
+1. **Never replace your actual `images.xlsx`.** Place your populated workbook at the path configured by `paths.workbook`. Use its matching `collection_state.json` if one already exists; these are a pair and must be preserved across backups/deployments.
+2. `python record.py status --all` creates the initial run snapshot if none exists, or **resumes the existing run** without resetting counts. On a pristine project, `python record.py start-run` also initializes run 1. The snapshot is serialized under the workbook lock.
+3. `python record.py status --agent-id 01` reports both total progress (`initial_count/target_count` at start) and new unique images collected in the current run. Progress is reconstructed from workbook rows, NOT from cached `progress.json`.
+4. Once all agents finish, explicitly run `python record.py start-run` to start the next fresh run. It snapshots the *entire existing workbook* and saves a new per-agent initial count/target in `collection_state.json`, while keeping all prior snapshots. To intentionally abandon an incomplete run, use `python record.py start-run --force`.
+5. **Do not use `start-run` to resume.** Just run status and continue with the same agent and cursor. Only change the individual `agent_quota` settings in `config.json` between runs. A mid-run quota change is refused rather than silently altering a persisted target.
+
+Example configuration (the values are editable, not hardcoded script quotas):
 
 ```json
-{
-  "agent_count": 10,
-  "agent_quota": {
-    "01": 500,
-    "02": 500,
-    "03": 500,
-    "04": 500,
-    "05": 500,
-    "06": 500,
-    "07": 500,
-    "08": 500,
-    "09": 500,
-    "10": 500
-  },
-  "wikimedia_contact": "YOUR_EMAIL_OR_WIKIMEDIA_USER_PAGE"
+"agent_quota": {
+  "01": 500, "02": 500, "03": 500, "04": 500, "05": 500,
+  "06": 500, "07": 500, "08": 500, "09": 500, "10": 500
 }
 ```
 
-These are editable **configuration examples**, not constants in any script. Each worker stops when **`agent_new_images_collected >= agent_quota`**, independent of other workers and workbook size. Each key must exist for its agent; all quotas must be nonnegative integers. The included project initializes ten worker directories; changing agent count requires corresponding worker directories/IDs.
-
-## Critical first-use migration for a populated workbook
-
-1. **Keep** your existing `images.xlsx` in the path configured as `paths.workbook`; do **not** replace it with an empty template. It can already contain rows (including rows with current agent IDs), or it can be empty.
-2. **Before running any collection process**, run `python record.py status --all` once to create `collection_state.json` beside the config at `paths.collection_state`. The baseline records the number and hash of all *existing* data rows; none of these rows count toward any agent's new quota. They remain included in global URL/filename deduplication.
-3. **Never delete, regenerate or reset `collection_state.json` after collection begins**. Always backup, move, and restore it **together with its matching `images.xlsx`**. Removing the state would incorrectly reclassify new rows as pre-existing. This file is initialized automatically under the shared lock if missing; proactively running status before agents is best practice.
-
-Each accepted append happens under the shared OS lock, rechecks the agent's newly-collected count and global URL deduplication, atomically replaces the XLSX, and updates the per-agent `progress.json` and `state.md`. After crashes, actual counts are rebuilt from workbook rows *after* the saved baseline, so stale cached progress cannot cause double-counting. No records are removed or rewritten. Out-of-band modification/reordering of original rows is detected through the baseline hash and requires recovery, not resetting the baseline.
-
-## Run independent Codex agents
-
-Paste `PROMPT_FOR_CODEX.txt` into each independent Codex conversation at project root, or use PowerShell launchers:
+## Commands
 
 ```powershell
 python project.py show
 python record.py status --all
-python claim_agent.py status
-python commons_api.py test
-.\run_one_agent.ps1 -AgentID 1
-.\run_all_agents.ps1
-# Resume only when earlier session for this ID is stopped:
-.\run_one_agent.ps1 -AgentID 1 -Resume
-```
-
-`claim_agent.py` atomically assigns unused IDs. Do not claim again in the same conversation. The worker manifest (`python project.py manifest --agent-id 01`) resolves all instruction and worker paths dynamically and displays that agent's `agent_quota`.
-
-```powershell
-python commons_api.py collect --agent-id 01 --max-pages 8 --max-accept 25
 python record.py status --agent-id 01
-python record.py status --all
 python record.py audit
+python record.py start-run        # Only to open a NEW collection run
+python commons_api.py test
+python commons_api.py collect --agent-id 01 --max-pages 8 --max-accept 25
 ```
 
-`--max-accept` and `--max-pages` are **batch limits only**. API calls are globally throttled. Add keywords only to your own worker file. Configure a genuine Wikimedia contact in `config.json` or `HRVS_WIKIMEDIA_CONTACT` before making API calls. Do not invent a contact.
+For independent Codex workers, use `PROMPT_FOR_CODEX.txt` or PowerShell launchers (`run_one_agent.ps1`, `run_all_agents.ps1`). Agent claims are unique and persistent. `project.py manifest --agent-id 01` resolves all worker and instruction paths from config. The worker search cursors/keyword pools persist for resume and subsequent runs; expand an exhausted agent's keywords instead of resetting its cursor.
 
-## Project files
+## How consistency is maintained
 
-- `config.json`: `agent_count`, independently set `agent_quota` per ID, API settings, configured paths.
-- `project.py`: validates config and provides quota/path manifests.
-- `collection_state.json` (created on first status/add, not initially bundled): persistent historical workbook baseline; preserve forever with workbook.
-- `images.xlsx`: existing historical + newly appended candidate records, retaining the original four-column format.
-- `record.py`: locked atomic append, deduplication against all workbook records, baseline reconciliation, per-agent progress and audit.
-- `commons_api.py`: Wikimedia API search and per-agent collection loop.
-- `claim_agent.py`: atomic ID claim/reservation.
-- `workers/`: independent worker keywords, cursor, progress, state and logs.
-- `AGENTS.md`, `TASK_PROMPT.txt`, `PROMPT_FOR_CODEX.txt`: instructions and prompts.
+- `collection_state.json` version 2 stores a **history of runs**, active run ID, per-agent `initial_count`, `agent_quota` and `target_count`, and a hash of the exact workbook prefix at each initialization. Version-1 collection state is migrated without reclassifying past collected images.
+- Existing workbook URLs remain in the global deduplication set forever. No pre-existing rows are deleted, reordered or rewritten by initialization. Only accepting a qualified new unique record appends to the XLSX.
+- OS lock serializes initialization, status, append and run transitions. Atomic XLSX saves avoid partial writes. State is written before a new run can collect; after an interrupted append, recovery recomputes new counts from rows beyond the saved run baseline.
+- Each batch pins a run ID: a collector left running across a new-run boundary cannot append to the new run by mistake.
+- There is no project-wide image cap; `--max-accept` and `--max-pages` control only individual API batches.
 
-## Dataset limitations
+## Notes
 
-Search results are metadata candidates, not visually verified HRVS images. Metadata cannot establish genuine visual complexity, small-object scale or authenticity. Carry out visual QA and per-file Wikimedia Commons license review before distributing image datasets. The shared Excel file has its intrinsic Excel format limitations; **no additional project-wide image quota or cap is imposed**.
+Set a real `wikimedia_contact` (or `HRVS_WIKIMEDIA_CONTACT`) before API calls. Collect metadata candidates only, never image bytes. Complex visual content, authenticity and each Commons license require independent verification. Never reset `collection_state.json` to reuse a quota: start a new run explicitly. Run offline tests with `python -m unittest discover -s tests -v`.

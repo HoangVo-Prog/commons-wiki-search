@@ -1,6 +1,6 @@
 {
   "agent_count": 10,
-  "wikimedia_contact": "YOUR_EMAIL_OR_WIKIMEDIA_USER_PAGE",
+  "wikimedia_contact": "vohoang2204@gmail.com",
   "min_seconds_between_api_requests": 1.5,
   "paths": {
     "worker_root": "workers",
@@ -19,15 +19,15 @@
     "collection_state": "collection_state.json"
   },
   "agent_quota": {
-    "01": 500,
-    "02": 500,
-    "03": 500,
-    "04": 500,
-    "05": 500,
-    "06": 500,
-    "07": 500,
-    "08": 500,
-    "09": 500,
-    "10": 500
+    "01": 1000,
+    "02": 1000,
+    "03": 1000,
+    "04": 1000,
+    "05": 1000,
+    "06": 1000,
+    "07": 1000,
+    "08": 1000,
+    "09": 1000,
+    "10": 1000
   }
 }

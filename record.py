@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Shared Excel append-only writer with independent config-defined agent quotas.
+"""Shared Excel append-only writer with fresh, per-run agent quotas.
 
 XLSX is an OOXML ZIP archive. This script edits only the first worksheet's four
 columns while retaining the rest of the workbook. OS locking and atomic replace
 make simultaneous worker processes safe on a local disk. Historical workbook
-rows are baseline-only and never consume newly collected per-agent quotas.
+rows remain preserved and count toward only the initial count of each new run.
 """
 from __future__ import annotations
 
@@ -229,41 +229,175 @@ def _historical_digest(rows: list[list[str]]) -> str:
     return digest.hexdigest()
 
 
-def load_collection_state(rows: list[list[str]]) -> dict:
-    """Called ONLY inside excel_lock. Persist the existing-row baseline first.
+def _count_agent_rows(rows: list[list[str]]) -> Counter:
+    """Count workbook records by agent ID, including old numeric IDs like '1'."""
+    result = Counter()
+    valid = set(project.ids())
+    for r in rows:
+        agent = str(r[0]).strip()
+        if agent.isascii() and agent.isdecimal() and len(agent) <= 2:
+            normalized = agent.zfill(2)
+            agent = normalized if normalized in valid else agent
+        result[agent] += 1
+    return result
 
-    After initialization, all new accepted rows follow the baseline and counts
-    are reconstructed directly from workbook rows. This survives a crash after
-    workbook replacement but before progress.json is updated. The file MUST NOT
-    be removed/reset on resume. Historical rows (including matching agent IDs)
-    never consume new-collection quota.
+
+def _snapshot_run(rows: list[list[str]], run_number: int, initialized_at: str | None = None,
+                  baseline_row_count: int | None = None, baseline_sha256: str | None = None) -> dict:
+    """Capture a complete immutable baseline and quota/target for EVERY agent."""
+    baseline = len(rows) - 1 if baseline_row_count is None else baseline_row_count
+    historical = rows[1:baseline + 1]
+    counts = _count_agent_rows(historical)
+    agents = {}
+    for agent in project.ids():
+        initial = counts[agent]
+        quota = project.quota(agent)
+        agents[agent] = {'initial_count': initial, 'agent_quota': quota,
+                         'target_count': initial + quota}
+    return {
+        'run_id': f'run-{run_number:06d}',
+        'initialized_at': initialized_at or timestamp(),
+        'baseline_row_count': baseline,
+        'baseline_sha256': baseline_sha256 or _historical_digest(rows[:baseline + 1]),
+        'agents': agents,
+    }
+
+
+def _save_collection_state(state: dict) -> None:
+    _atomic_text(project.project_path('collection_state'),
+                 json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+
+
+def _active_run(state: dict) -> dict:
+    matches = [r for r in state['runs'] if r['run_id'] == state['active_run_id']]
+    if len(matches) != 1:
+        raise RuntimeError('Invalid collection_state.json: active_run_id must identify one run')
+    return matches[0]
+
+
+def _validate_run(run: dict, rows: list[list[str]]) -> None:
+    baseline = run.get('baseline_row_count')
+    if (type(baseline) is not int or baseline < 0 or baseline > len(rows) - 1
+            or run.get('baseline_sha256') != _historical_digest(rows[:baseline + 1])):
+        raise RuntimeError('Existing workbook rows changed or baseline is invalid. '
+                           'Restore the original matching images.xlsx and collection_state.json.')
+    agents = run.get('agents')
+    if not isinstance(agents, dict) or set(agents) != set(project.ids()):
+        raise RuntimeError(f'Invalid run agent snapshot in {run.get("run_id")}.')
+    actual_initial = _count_agent_rows(rows[1:baseline + 1])
+    for agent, snapshot in agents.items():
+        if not isinstance(snapshot, dict):
+            raise RuntimeError(f'Invalid snapshot for agent {agent}')
+        initial, quota, target = (snapshot.get('initial_count'), snapshot.get('agent_quota'),
+                                  snapshot.get('target_count'))
+        if (type(initial) is not int or type(quota) is not int or type(target) is not int
+                or initial != actual_initial[agent] or quota < 0 or target != initial + quota):
+            raise RuntimeError(f'Invalid initial_count/target_count for agent {agent}; '
+                               'do not reset or hand-edit the run snapshot.')
+
+
+def load_collection_state(rows: list[list[str]]) -> dict:
+    """Called exclusively under excel_lock; initialize/migrate without losing progress.
+
+    New runs require an explicit `record.py start-run` invocation. A normal status,
+    collector startup, or process resume NEVER creates a new run if a state exists.
+    Historical v1 state migrates in-place, keeping the original baseline and all
+    already-added records in the original run (even if progress.json is stale).
     """
     path = project.project_path('collection_state')
     if not path.exists():
-        state = {
-            'version': 1,
-            'baseline_row_count': len(rows) - 1,
-            'baseline_sha256': _historical_digest(rows),
-            'initialized_at': timestamp(),
-        }
-        _atomic_text(path, json.dumps(state, ensure_ascii=False, indent=2) + '\n')
+        first = _snapshot_run(rows, 1)
+        state = {'version': 2, 'active_run_id': first['run_id'], 'runs': [first]}
+        _save_collection_state(state)
     else:
         state = json.loads(path.read_text(encoding='utf-8'))
-    baseline = state.get('baseline_row_count')
-    if (state.get('version') != 1 or type(baseline) is not int or baseline < 0
-            or baseline > len(rows) - 1
-            or state.get('baseline_sha256') != _historical_digest(rows[:baseline + 1])):
-        raise RuntimeError('Existing workbook rows changed or baseline is invalid. '
-                           'Restore the original workbook/baseline together; never reset collection_state.json to bypass progress.')
+        if state.get('version') == 1:
+            baseline = state.get('baseline_row_count')
+            if (type(baseline) is not int or baseline < 0 or baseline > len(rows) - 1
+                    or state.get('baseline_sha256') != _historical_digest(rows[:baseline + 1])):
+                raise RuntimeError('Existing workbook rows changed or baseline is invalid. '
+                                   'Cannot safely migrate old collection_state.json.')
+            first = _snapshot_run(rows, 1, state.get('initialized_at'), baseline,
+                                  state.get('baseline_sha256'))
+            state = {'version': 2, 'active_run_id': first['run_id'], 'runs': [first]}
+            _save_collection_state(state)
+    if (state.get('version') != 2 or not isinstance(state.get('runs'), list)
+            or not state['runs'] or not isinstance(state.get('active_run_id'), str)):
+        raise RuntimeError('Invalid collection_state.json; restore its matching backup.')
+    if len({r.get('run_id') for r in state['runs']}) != len(state['runs']):
+        raise RuntimeError('Duplicate run IDs in collection_state.json')
+    for run in state['runs']:
+        _validate_run(run, rows)
+    _active_run(state)
     return state
 
 
-def collection_counts(rows: list[list[str]]) -> tuple[Counter, dict]:
-    """Reconcile durable per-agent counts from post-baseline workbook rows."""
+def collection_counts(rows: list[list[str]], require_config_match: bool = True) -> tuple[Counter, dict]:
+    """Return counts added in active run, plus immutable per-agent run snapshot."""
     state = load_collection_state(rows)
-    start = state['baseline_row_count'] + 1
-    return Counter(r[0] for r in rows[start:]), state
+    run = _active_run(state)
+    if require_config_match:
+        for agent, snapshot in run['agents'].items():
+            if snapshot['agent_quota'] != project.quota(agent):
+                raise RuntimeError(
+                    f'Config quota for agent {agent} changed during {run["run_id"]}: '
+                    f'run={snapshot["agent_quota"]}, config={project.quota(agent)}. '
+                    'Restore the run quota in config.json to resume, or start a NEW '
+                    'run with `python record.py start-run` (use --force if incomplete).'
+                )
+    start = run['baseline_row_count'] + 1
+    return _count_agent_rows(rows[start:]), run
 
+
+def _run_snapshot(run: dict, agent: str, new_count: int) -> dict:
+    snap = run['agents'][agent]
+    return {'run_id': run['run_id'], 'initial_count': snap['initial_count'],
+            'agent_quota': snap['agent_quota'], 'target_count': snap['target_count'],
+            'current_count': snap['initial_count'] + new_count,
+            'agent_new_images_collected': new_count,
+            'remaining': max(0, snap['agent_quota'] - new_count)}
+
+
+def _progress_description(run: dict, agent: str, new_count: int) -> str:
+    snap = _run_snapshot(run, agent, new_count)
+    return (f'run={snap["run_id"]} | progress={snap["current_count"]}/'
+            f'{snap["target_count"]} | agent_new_images_collected={new_count}/'
+            f'{snap["agent_quota"]}')
+
+
+def cmd_start_run(args):
+    """Explicitly start a fresh run, snapshotting all existing agent image counts."""
+    with excel_lock():
+        _, _, rows = load_sheet()
+        state_file = project.project_path('collection_state')
+        # On a pristine project, the first explicit start creates run-000001,
+        # not an empty artificial run immediately followed by run-000002.
+        if not state_file.exists():
+            state = load_collection_state(rows)
+            new_run = _active_run(state)
+            previous = '(none)'
+        else:
+            state = load_collection_state(rows)
+            current = _active_run(state)
+            counts = _count_agent_rows(rows[current['baseline_row_count'] + 1:])
+            unfinished = [a for a in project.ids()
+                          if counts[a] < current['agents'][a]['agent_quota']]
+            if unfinished and not args.force:
+                fatal(f'Current run {current["run_id"]} is still incomplete for agents '
+                      f'{", ".join(unfinished)}. To intentionally abandon the remaining '
+                      'quota and start a fresh run, use `record.py start-run --force`.')
+            next_number = max(int(r['run_id'].split('-')[-1]) for r in state['runs']) + 1
+            new_run = _snapshot_run(rows, next_number)
+            state['runs'].append(new_run)
+            state['active_run_id'] = new_run['run_id']
+            _save_collection_state(state)
+            previous = current['run_id']
+        for agent in project.ids():
+            write_state(agent, 0, new_run, last_action='NEW_RUN_INITIALIZED')
+        print(f'RUN_STARTED | run={new_run["run_id"]} | existing_workbook_rows={len(rows)-1} '
+              f'| previous_run={previous}')
+        for agent in project.ids():
+            print(f'agent_{agent}: {_progress_description(new_run, agent, 0)}')
 
 def _progress(agent: str) -> dict:
     dest = project.worker_file(agent, 'progress')
@@ -282,12 +416,12 @@ def _progress(agent: str) -> dict:
     return data
 
 
-def write_state(agent: str, new_count: int, updates: dict | None = None, last_action: str | None = None):
-    """Call while holding excel_lock to serialize state/cache updates too."""
+def write_state(agent: str, new_count: int, run: dict, updates: dict | None = None,
+                last_action: str | None = None):
+    """Call inside excel_lock; cache is derived from the authoritative workbook/run."""
     p = _progress(agent)
-    limit = project.quota(agent)
-    p.update({'agent_id': agent, 'agent_quota': limit,
-              'agent_new_images_collected': new_count})
+    snap = _run_snapshot(run, agent, new_count)
+    p.update({'agent_id': agent, **snap})
     if updates:
         p.update({k: v for k, v in updates.items() if v is not None})
     if last_action is not None:
@@ -295,30 +429,26 @@ def write_state(agent: str, new_count: int, updates: dict | None = None, last_ac
     p['last_updated'] = timestamp()
     _atomic_text(project.worker_file(agent, 'progress'), json.dumps(p, ensure_ascii=False, indent=2) + '\n')
     md = (f'# Agent {agent} — State\n\n'
-          f'- **Status:** {"COMPLETE" if new_count >= limit else "ACTIVE"}\n'
-          f'- **Agent new images collected:** {new_count} / {limit}\n'
-          f'- **Remaining:** {max(0, limit - new_count)}\n'
+          f'- **Run ID:** {snap["run_id"]}\n'
+          f'- **Status:** {"COMPLETE" if new_count >= snap["agent_quota"] else "ACTIVE"}\n'
+          f'- **Initial count (existing rows):** {snap["initial_count"]}\n'
+          f'- **Target count:** {snap["target_count"]}\n'
+          f'- **Total progress:** {snap["current_count"]} / {snap["target_count"]}\n'
+          f'- **New unique images this run:** {new_count} / {snap["agent_quota"]}\n'
+          f'- **Remaining this run:** {snap["remaining"]}\n'
           f'- **Current keyword:** {p.get("current_keyword", "")}\n'
           f'- **Search page:** {p.get("page", "")}\n'
           f'- **Last action:** {p.get("last_action", "")}\n'
           f'- **Next action:** {p.get("next_action", "")}\n'
           f'- **Last updated:** {p["last_updated"]}\n\n'
-          '**Recovery:** Run `python project.py manifest --agent-id '
-          f'{agent}` and `python record.py status --agent-id {agent}`. '
-          'The workbook plus immutable collection_state.json baseline is authoritative. '
-          'Never delete or reset the baseline on resume.\n')
+          '**Recovery:** Reopen the same run with `python record.py status --agent-id '
+          f'{agent}`. The paired workbook and collection_state.json are authoritative. '
+          'Only `python record.py start-run` creates a new fresh run.\n')
     _atomic_text(project.worker_file(agent, 'state'), md)
-
 
 def event(agent: str, kind: str, details: str):
     with project.worker_file(agent, 'events').open('a', encoding='utf-8') as f:
         f.write(f'[{timestamp()}] {kind} | {details}\n')
-
-
-def counts_and_rows() -> tuple[Counter, list[list[str]], dict]:
-    _, _, rows = load_sheet()
-    counts, baseline = collection_counts(rows)
-    return counts, rows, baseline
 
 
 def _existing_url_key(url: str) -> str:
@@ -339,51 +469,58 @@ def cmd_add(args):
         canon_name = canonical_filename(name)
     except ValueError as ex:
         fatal(str(ex))
-    limit = project.quota(agent)
     with excel_lock():
         xml, sheet_data, rows = load_sheet()
-        counts, baseline = collection_counts(rows)  # initializes historical baseline before appending
+        counts, run = collection_counts(rows)
+        if args.run_id and args.run_id != run['run_id']:
+            fatal(f'Collector started in {args.run_id}, but active run is {run["run_id"]}. '
+                  'Stop the old collector and initialize a fresh one for the new run.')
         new_count = counts[agent]
+        limit = run['agents'][agent]['agent_quota']
         if new_count >= limit:
-            print(f'QUOTA_REACHED | agent={agent} | agent_new_images_collected={new_count}/{limit}')
-            write_state(agent, new_count, last_action='QUOTA_REACHED')
-            event(agent, 'QUOTA_REACHED', f'agent_new_images_collected={new_count}')
+            print(f'QUOTA_REACHED | agent={agent} | {_progress_description(run, agent, new_count)}')
+            write_state(agent, new_count, run, last_action='QUOTA_REACHED')
+            event(agent, 'QUOTA_REACHED', f'{_progress_description(run, agent, new_count)}')
             return
         for r in rows[1:]:
             if canon_name == canonical_filename(r[1]) or canon_url == _existing_url_key(r[2]):
-                print(f'DUPLICATE | agent={agent} | existing_agent={r[0]} | filename={r[1]} | agent_new_images_collected={new_count}/{limit}')
-                write_state(agent, new_count, last_action=f'DUPLICATE {name}')
+                print(f'DUPLICATE | agent={agent} | existing_agent={r[0]} '
+                      f'| filename={r[1]} | {_progress_description(run, agent, new_count)}')
+                write_state(agent, new_count, run, last_action=f'DUPLICATE {name}')
                 event(agent, 'DUPLICATE', f'filename={name} | existing_agent={r[0]}')
                 return
         try:
             _save_appended_row(xml, sheet_data, len(rows), [agent, name, url, reason])
         except PermissionError:
             fatal('Cannot write images.xlsx: close it in Excel and disable cloud live-sync')
-        # If interrupted here, the appended XLSX row is still counted on resume.
+        # Row-based reconciliation counts this append even if a crash precedes progress update.
         new_count += 1
-        write_state(agent, new_count, last_action=f'ACCEPTED {name}')
-        event(agent, 'ACCEPTED', f'filename={name} | agent_new_images_collected={new_count}/{limit}')
-        print(f'ACCEPTED | agent={agent} | agent_new_images_collected={new_count}/{limit} | filename={name}')
+        write_state(agent, new_count, run, last_action=f'ACCEPTED {name}')
+        event(agent, 'ACCEPTED', f'filename={name} | {_progress_description(run, agent, new_count)}')
+        print(f'ACCEPTED | agent={agent} | {_progress_description(run, agent, new_count)} | filename={name}')
 
 
 def cmd_status(args):
     if args.all:
         with excel_lock():
-            counts, rows, baseline = counts_and_rows()
+            counts, rows, run = counts_and_rows()
             for a in project.ids():
-                write_state(a, counts[a])
-            lines = [f'agent_{a}: agent_new_images_collected={counts[a]}/{project.quota(a)}' for a in project.ids()]
-            lines.append(f'WORKBOOK | existing_rows={baseline["baseline_row_count"]} | newly_collected_rows={len(rows)-1-baseline["baseline_row_count"]} | workbook_rows={len(rows)-1} | no_global_cap=true')
+                write_state(a, counts[a], run)
+            lines = [f'agent_{a}: {_progress_description(run, a, counts[a])}' for a in project.ids()]
+            lines.append(f'WORKBOOK | run={run["run_id"]} | existing_rows={run["baseline_row_count"]} '
+                         f'| newly_collected_rows={len(rows)-1-run["baseline_row_count"]} '
+                         f'| workbook_rows={len(rows)-1} | no_global_cap=true')
         print('\n'.join(lines))
     else:
         agent = agent_from_workdir(args.agent_id)
         with excel_lock():
-            counts, rows, baseline = counts_and_rows()
+            counts, rows, run = counts_and_rows()
             new_count = counts[agent]
-            limit = project.quota(agent)
-            write_state(agent, new_count)
+            write_state(agent, new_count, run)
             state = _progress(agent)
-        print(f'STATUS | agent={agent} | agent_new_images_collected={new_count}/{limit} | remaining={max(0, limit-new_count)} | existing_workbook_rows={baseline["baseline_row_count"]}')
+        print(f'STATUS | agent={agent} | {_progress_description(run, agent, new_count)} '
+              f'| remaining={max(0, run["agents"][agent]["agent_quota"]-new_count)} '
+              f'| existing_workbook_rows={run["baseline_row_count"]}')
         print(f'KEYWORD | {state.get("current_keyword", "")} | page={state.get("page", "")}')
         print(f'NEXT | {state.get("next_action", "")}')
 
@@ -391,50 +528,65 @@ def cmd_status(args):
 def cmd_checkpoint(args):
     agent = agent_from_workdir(args.agent_id)
     with excel_lock():
-        counts, _, _ = counts_and_rows()
+        counts, run = collection_counts(load_sheet()[2])
+        if args.run_id and args.run_id != run['run_id']:
+            fatal(f'Stale collector run {args.run_id}; active run is {run["run_id"]}')
         new_count = counts[agent]
-        limit = project.quota(agent)
         updates = {'current_keyword': args.keyword, 'page': args.page, 'next_action': args.next_action}
-        write_state(agent, new_count, updates=updates, last_action='CHECKPOINT')
-        event(agent, 'CHECKPOINT', f'agent_new_images_collected={new_count}/{limit} | keyword={args.keyword or "(unchanged)"} | page={args.page or "(unchanged)"} | next={args.next_action or "(unchanged)"}')
-    print(f'CHECKPOINT | agent={agent} | agent_new_images_collected={new_count}/{limit}')
+        write_state(agent, new_count, run, updates=updates, last_action='CHECKPOINT')
+        event(agent, 'CHECKPOINT', f'{_progress_description(run, agent, new_count)} '
+              f'| keyword={args.keyword or "(unchanged)"} | page={args.page or "(unchanged)"} '
+              f'| next={args.next_action or "(unchanged)"}')
+    print(f'CHECKPOINT | agent={agent} | {_progress_description(run, agent, new_count)}')
 
 
 def cmd_note(args):
     agent = agent_from_workdir(args.agent_id)
     message = safe_text(args.message, 1000, 'message')
     with excel_lock():
-        counts, _, _ = counts_and_rows()
+        counts, run = collection_counts(load_sheet()[2])
+        if args.run_id and args.run_id != run['run_id']:
+            fatal(f'Stale collector run {args.run_id}; active run is {run["run_id"]}')
         new_count = counts[agent]
-        limit = project.quota(agent)
-        write_state(agent, new_count, last_action=f'NOTE {message}')
+        write_state(agent, new_count, run, last_action=f'NOTE {message}')
         event(agent, 'NOTE', message)
-    print(f'NOTED | agent={agent} | agent_new_images_collected={new_count}/{limit}')
+    print(f'NOTED | agent={agent} | {_progress_description(run, agent, new_count)}')
 
 
 def cmd_audit(_args):
     with excel_lock():
-        counts, rows, baseline = counts_and_rows()
+        counts, rows, run = counts_and_rows()
     urls = [_existing_url_key(r[2]) for r in rows[1:]]
     names = [canonical_filename(r[1]) for r in rows[1:]]
     url_dup = [k for k, v in Counter(urls).items() if k and v > 1]
     name_dup = [k for k, v in Counter(names).items() if k and v > 1]
     unknown_new = {k: v for k, v in counts.items() if k not in project.ids()}
-    # If an operator decreases a quota after collecting, existing records are
-    # preserved and collecting stops, but audit reports the over-quota situation.
-    over = {k: v for k, v in counts.items() if k in project.ids() and v > project.quota(k)}
-    print(f'WORKBOOK_ROWS={len(rows)-1} | HISTORICAL_ROWS={baseline["baseline_row_count"]} | NEW_ROWS={len(rows)-1-baseline["baseline_row_count"]}')
+    over = {k: v for k, v in counts.items()
+            if k in project.ids() and v > run['agents'][k]['agent_quota']}
+    print(f'RUN_ID={run["run_id"]} | WORKBOOK_ROWS={len(rows)-1} '
+          f'| HISTORICAL_ROWS={run["baseline_row_count"]} '
+          f'| NEW_ROWS={len(rows)-1-run["baseline_row_count"]}')
     print(f'UNIQUE_URLS={len(set(urls))} | UNIQUE_FILENAMES={len(set(names))}')
     print(f'DUPLICATE_URL_KEYS={len(url_dup)} | DUPLICATE_FILENAME_KEYS={len(name_dup)}')
     print(f'UNKNOWN_NEW_AGENT_IDS={unknown_new} | OVER_AGENT_QUOTA={over}')
     if url_dup or name_dup or unknown_new or over:
         raise SystemExit(1)
 
+
+def counts_and_rows() -> tuple[Counter, list[list[str]], dict]:
+    _, _, rows = load_sheet()
+    counts, run = collection_counts(rows)
+    return counts, rows, run
+
 def main():
     parser = argparse.ArgumentParser(description='Atomic shared XLSX writer for HRVS Codex agents')
     sub = parser.add_subparsers(dest='action', required=True)
-    add = sub.add_parser('add', help='Append a unique verified Commons original-file URL')
+    start = sub.add_parser('start-run', help='Explicitly snapshot existing records and start a fresh collection run')
+    start.add_argument('--force', action='store_true', help='Abandon any incomplete quota from the preceding run')
+    start.set_defaults(func=cmd_start_run)
+    add = sub.add_parser('add', help='Append a unique Commons original-file URL candidate')
     add.add_argument('--agent-id', help='Configured agent ID (normally inferred from cwd)')
+    add.add_argument('--run-id', help='Optional pinned run ID: reject stale collector processes')
     add.add_argument('--original-filename', required=True)
     add.add_argument('--original-image-url', required=True)
     add.add_argument('--hrvs-suitability', required=True)
@@ -445,12 +597,14 @@ def main():
     status.set_defaults(func=cmd_status)
     cp = sub.add_parser('checkpoint', help='Remember current keyword / page / next step')
     cp.add_argument('--agent-id')
+    cp.add_argument('--run-id')
     cp.add_argument('--keyword')
     cp.add_argument('--page')
     cp.add_argument('--next-action')
     cp.set_defaults(func=cmd_checkpoint)
     nt = sub.add_parser('note', help='Write an important blocker / reminder')
     nt.add_argument('--agent-id')
+    nt.add_argument('--run-id')
     nt.add_argument('--message', required=True)
     nt.set_defaults(func=cmd_note)
     audit = sub.add_parser('audit', help='Check uniqueness and per-agent quotas')
