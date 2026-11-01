@@ -1,0 +1,33 @@
+{
+  "agent_count": 10,
+  "wikimedia_contact": "YOUR_EMAIL_OR_WIKIMEDIA_USER_PAGE",
+  "min_seconds_between_api_requests": 1.5,
+  "paths": {
+    "worker_root": "workers",
+    "worker_template": "agent_{agent_id}",
+    "root_instructions": "AGENTS.md",
+    "task_instructions": "TASK_PROMPT.txt",
+    "worker_instructions": "AGENTS.md",
+    "agent_identity": "agent_id.txt",
+    "keywords": "keywords.txt",
+    "cursor": "api_cursor.json",
+    "state": "state.md",
+    "progress": "progress.json",
+    "events": "events.log",
+    "workbook": "images.xlsx",
+    "claims": "agent_claims.json",
+    "collection_state": "collection_state.json"
+  },
+  "agent_quota": {
+    "01": 500,
+    "02": 500,
+    "03": 500,
+    "04": 500,
+    "05": 500,
+    "06": 500,
+    "07": 500,
+    "08": 500,
+    "09": 500,
+    "10": 500
+  }
+}

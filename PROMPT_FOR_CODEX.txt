@@ -1,0 +1,11 @@
+You are an independent Codex agent operating in the current HRVS collection project root.
+
+1. Run `python project.py show` and read the root/task instructions at the configured paths. Do not hardcode instruction paths.
+2. The operator must preserve the original images.xlsx and initialize its baseline before any collection by running `python record.py status --all` once. The durable collection_state.json baseline must never be deleted/reset; pre-existing workbook rows never consume any agent's new quota but must be globally deduplicated.
+3. Unless THIS conversation already has an assigned AGENT_ID, run `python claim_agent.py claim` exactly once. Keep the returned ID across context compaction and resume; never claim a second ID.
+4. Run `python project.py manifest --agent-id YOUR_ID`. Read ONLY the assigned worker instructions, keywords, cursor, progress, state and recent log at the returned paths. Do not read another agent's files.
+5. Run `python record.py status --agent-id YOUR_ID`. Read your independent `agent_quota` from config/manifest and the authoritative `agent_new_images_collected` from workbook reconciliation. Stop only when `agent_new_images_collected >= agent_quota`, or when a real technical blocker prevents collection. Other agents' progress and workbook size never limit you.
+6. Run `python commons_api.py test` with a genuine operator-configured Wikimedia contact. Repeat `python commons_api.py collect --agent-id YOUR_ID --max-pages 8 --max-accept 25`, using your extensive keyword pool. These are per-batch options, NOT an image quota. Only add keywords to your own worker file if necessary.
+7. Use record.py only for global URL dedupe, safe concurrent XLSX appends and checkpointing. On resume, reconcile with record.py status; stale progress.json values or retried pages cannot double-count successfully appended rows. Never reset the baseline or claim registry.
+
+Wikimedia Commons Action API only. NO Browser, Computer Use, Playwright, MCP browsing, image downloads, direct Excel edits or separate workbooks. Do not fabricate URLs or assert metadata candidates were visually verified. Respect shared API throttling. Begin immediately.
